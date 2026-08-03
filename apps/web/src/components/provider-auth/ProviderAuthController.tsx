@@ -93,9 +93,12 @@ function ProviderAuthTerminal({ state }: { readonly state: ProviderAuthDialogSta
   const latestHistoryRef = useRef("");
   const [viewMode, setViewMode] = useState<"transcript" | "terminal">("transcript");
   const [transcript, setTranscript] = useState("");
+  const [terminalError, setTerminalError] = useState<string | null>(null);
   const viewModeRef = useRef(viewMode);
   viewModeRef.current = viewMode;
   const { resolvedTheme } = useTheme();
+  const resolvedThemeRef = useRef(resolvedTheme);
+  resolvedThemeRef.current = resolvedTheme;
   const write = useAtomCommand(providerAuthEnvironment.write, { reportFailure: false });
   const resize = useAtomCommand(providerAuthEnvironment.resize, { reportFailure: false });
   const cancel = useAtomCommand(providerAuthEnvironment.cancel, { reportFailure: false });
@@ -117,8 +120,9 @@ function ProviderAuthTerminal({ state }: { readonly state: ProviderAuthDialogSta
     let disposed = false;
     let surface: GhosttyTerminalSurface | null = null;
     setTranscript("");
+    setTerminalError(null);
     void GhosttyTerminalSurface.create(mount, {
-      theme: authTerminalTheme(resolvedTheme),
+      theme: authTerminalTheme(resolvedThemeRef.current),
       onData: (data) => {
         void write({ environmentId: state.environmentId, input: { sessionId, data } });
       },
@@ -129,18 +133,28 @@ function ProviderAuthTerminal({ state }: { readonly state: ProviderAuthDialogSta
       onCopy: (text) => void navigator.clipboard?.writeText(text),
       beforeKey: () => true,
       onLinkActivate: (text) => window.open(text, "_blank", "noopener,noreferrer"),
-    }).then((created) => {
-      if (disposed) {
-        created.dispose();
-        return;
-      }
-      surface = created;
-      terminalRef.current = created;
-      writtenHistoryRef.current = latestHistoryRef.current;
-      if (writtenHistoryRef.current) created.resetAndWrite(writtenHistoryRef.current);
-      setTranscript(created.getTranscript());
-      if (viewModeRef.current === "terminal") created.focus();
-    });
+    })
+      .then((created) => {
+        if (disposed) {
+          created.dispose();
+          return;
+        }
+        surface = created;
+        terminalRef.current = created;
+        created.setTheme(authTerminalTheme(resolvedThemeRef.current));
+        writtenHistoryRef.current = latestHistoryRef.current;
+        if (writtenHistoryRef.current) created.resetAndWrite(writtenHistoryRef.current);
+        setTranscript(created.getTranscript());
+        if (viewModeRef.current === "terminal") created.focus();
+      })
+      .catch((cause: unknown) => {
+        if (disposed) return;
+        const message =
+          cause instanceof Error && cause.message.trim()
+            ? cause.message
+            : "Could not initialize the authentication terminal.";
+        setTerminalError(message);
+      });
     return () => {
       disposed = true;
       surface?.dispose();
@@ -177,7 +191,7 @@ function ProviderAuthTerminal({ state }: { readonly state: ProviderAuthDialogSta
   }, [snapshot?.history]);
 
   const status = snapshot?.status;
-  const message = state.error ?? attach.error ?? snapshot?.message ?? null;
+  const message = state.error ?? terminalError ?? attach.error ?? snapshot?.message ?? null;
 
   return (
     <div className="space-y-3 px-6 pb-4">
@@ -235,9 +249,12 @@ function ProviderAuthTerminal({ state }: { readonly state: ProviderAuthDialogSta
       {message ? (
         <p
           className={
-            status === "succeeded"
+            status === "succeeded" && terminalError === null
               ? "text-sm text-success"
-              : status === "failed" || state.error !== null || attach.error !== null
+              : status === "failed" ||
+                  state.error !== null ||
+                  terminalError !== null ||
+                  attach.error !== null
                 ? "text-sm text-destructive"
                 : "text-sm text-muted-foreground"
           }
@@ -268,7 +285,6 @@ function ProviderAuthSetupPrompt() {
   const { isProviderAuthOpen, openProviderAuth } = useProviderAuthController();
   const storageKey = environment ? `t3:provider-auth-setup:${environment.environmentId}` : null;
   const [dismissedKey, setDismissedKey] = useState<string | null>(null);
-  const promptedKeyRef = useRef<string | null>(null);
   const candidates = selectProviderAuthSetupCandidates(providers);
   const dismissed =
     storageKey === null ||
@@ -280,17 +296,6 @@ function ProviderAuthSetupPrompt() {
     window.localStorage.setItem(storageKey, "dismissed");
     setDismissedKey(storageKey);
   };
-
-  useEffect(() => {
-    if (!dismissed && candidates.length > 0 && storageKey !== null) {
-      promptedKeyRef.current = storageKey;
-      return;
-    }
-    if (storageKey !== null && promptedKeyRef.current === storageKey && candidates.length === 0) {
-      window.localStorage.setItem(storageKey, "dismissed");
-      setDismissedKey(storageKey);
-    }
-  }, [candidates.length, dismissed, storageKey]);
 
   return (
     <Dialog
@@ -352,10 +357,12 @@ function ProviderAuthSetupPrompt() {
 export function ProviderAuthController({ children }: { readonly children: ReactNode }) {
   const [state, setState] = useState<ProviderAuthDialogState | null>(null);
   const [signOutConfirmation, setSignOutConfirmation] = useState<ProviderAuthTarget | null>(null);
+  const startInvocationRef = useRef(0);
   const start = useAtomCommand(providerAuthEnvironment.start, { reportFailure: false });
 
   const beginProviderAuth = useCallback(
     (target: ProviderAuthTarget) => {
+      const invocation = ++startInvocationRef.current;
       setState({
         ...target,
         sessionId: target.activeSessionId ?? null,
@@ -368,6 +375,7 @@ export function ProviderAuthController({ children }: { readonly children: ReactN
       }).then((result) => {
         setState((current) => {
           if (
+            invocation !== startInvocationRef.current ||
             current === null ||
             current.environmentId !== target.environmentId ||
             current.instanceId !== target.instanceId ||

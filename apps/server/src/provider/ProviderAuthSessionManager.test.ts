@@ -3,6 +3,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderAuthAttachStreamEvent,
+  type ProviderAuthSessionSnapshot,
   type ServerProvider,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
@@ -11,13 +12,13 @@ import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Stream from "effect/Stream";
 
-import * as PtyAdapter from "../../terminal/PtyAdapter.ts";
-import type { ProviderInstance } from "../ProviderDriver.ts";
-import { makeProviderAuthenticationCapability } from "../providerAuthentication.ts";
-import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
-import { ProviderRegistry } from "../Services/ProviderRegistry.ts";
-import { makeProviderRegistryMock } from "../testUtils/providerRegistryMock.ts";
-import { make } from "./ProviderAuthSessionManager.ts";
+import * as PtyAdapter from "../terminal/PtyAdapter.ts";
+import type { ProviderInstance } from "./ProviderDriver.ts";
+import * as ProviderAuthSessionManager from "./ProviderAuthSessionManager.ts";
+import { makeProviderAuthenticationCapability } from "./providerAuthentication.ts";
+import { ProviderInstanceRegistry } from "./Services/ProviderInstanceRegistry.ts";
+import { ProviderRegistry } from "./Services/ProviderRegistry.ts";
+import { makeProviderRegistryMock } from "./testUtils/providerRegistryMock.ts";
 
 const INSTANCE_ID = ProviderInstanceId.make("codex");
 const PROVIDER: ServerProvider = {
@@ -34,7 +35,13 @@ const PROVIDER: ServerProvider = {
   skills: [],
 };
 
-function testHarness() {
+function testHarness(
+  options: {
+    readonly yieldBeforeSpawn?: boolean;
+    readonly exitOnSpawn?: boolean;
+    readonly refreshedAuth?: ServerProvider["auth"]["status"];
+  } = {},
+) {
   let onData: ((data: string) => void) | null = null;
   let onExit: ((event: PtyAdapter.PtyExitEvent) => void) | null = null;
   const writes: string[] = [];
@@ -76,7 +83,15 @@ function testHarness() {
   const registry = makeProviderRegistryMock([PROVIDER]);
   const layer = Layer.mergeAll(
     Layer.succeed(PtyAdapter.PtyAdapter, {
-      spawn: (input) => Effect.sync(() => (spawns.push(input), process)),
+      spawn: (input) =>
+        Effect.gen(function* () {
+          if (options.yieldBeforeSpawn) yield* Effect.yieldNow;
+          spawns.push(input);
+          if (options.exitOnSpawn) {
+            queueMicrotask(() => onExit?.({ exitCode: 0, signal: null }));
+          }
+          return process;
+        }),
     }),
     Layer.succeed(ProviderInstanceRegistry, {
       getInstance: () => Effect.succeed(instance),
@@ -88,7 +103,17 @@ function testHarness() {
     Layer.succeed(ProviderRegistry, {
       ...registry,
       refreshInstance: () =>
-        Effect.sync(() => ((refreshes += 1), [{ ...PROVIDER, auth: { status: "authenticated" } }])),
+        Effect.sync(
+          () => (
+            (refreshes += 1),
+            [
+              {
+                ...PROVIDER,
+                auth: { status: options.refreshedAuth ?? "authenticated" },
+              },
+            ]
+          ),
+        ),
       setProviderAuthSessionState: (state) =>
         Effect.sync(() => (authStates.push(state.activeSession), [PROVIDER])),
     }),
@@ -113,7 +138,7 @@ describe("ProviderAuthSessionManager", () => {
       const output = yield* Deferred.make<ProviderAuthAttachStreamEvent>();
       const settled = yield* Deferred.make<ProviderAuthAttachStreamEvent>();
       const program = Effect.gen(function* () {
-        const manager = yield* make();
+        const manager = yield* ProviderAuthSessionManager.make();
         const first = yield* manager.start({
           instanceId: INSTANCE_ID,
           action: "signIn",
@@ -165,11 +190,79 @@ describe("ProviderAuthSessionManager", () => {
     }),
   );
 
+  it.effect("serializes concurrent starts for the same provider instance", () =>
+    Effect.gen(function* () {
+      const harness = testHarness({ yieldBeforeSpawn: true });
+      const program = Effect.gen(function* () {
+        const manager = yield* ProviderAuthSessionManager.make();
+        const [first, second] = yield* Effect.all(
+          [
+            manager.start({ instanceId: INSTANCE_ID, action: "signIn" }),
+            manager.start({ instanceId: INSTANCE_ID, action: "signIn" }),
+          ],
+          { concurrency: "unbounded" },
+        );
+
+        expect(second.sessionId).toBe(first.sessionId);
+        expect(harness.spawns).toHaveLength(1);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      yield* program;
+    }),
+  );
+
+  it.effect("settles a process that exits while startup is completing", () =>
+    Effect.gen(function* () {
+      const harness = testHarness({ exitOnSpawn: true });
+      const program = Effect.gen(function* () {
+        const manager = yield* ProviderAuthSessionManager.make();
+        const session = yield* manager.start({ instanceId: INSTANCE_ID, action: "signIn" });
+        yield* Effect.yieldNow;
+        yield* Effect.yieldNow;
+        expect(harness.authStates).toEqual([
+          { sessionId: session.sessionId, action: "signIn" },
+          null,
+        ]);
+        const settled = yield* Deferred.make<ProviderAuthSessionSnapshot>();
+        yield* manager.attachStream({ sessionId: session.sessionId }, (event) =>
+          event.type === "snapshot" && event.snapshot.status !== "running"
+            ? Deferred.succeed(settled, event.snapshot)
+            : event.type === "settled"
+              ? Deferred.succeed(settled, event.snapshot)
+              : Effect.void,
+        );
+        expect(yield* Deferred.await(settled)).toMatchObject({
+          status: "succeeded",
+        });
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      yield* program;
+    }),
+  );
+
+  it.effect("fails when a successful command leaves auth state unverifiable", () =>
+    Effect.gen(function* () {
+      const harness = testHarness({ refreshedAuth: "unknown" });
+      const settled = yield* Deferred.make<ProviderAuthSessionSnapshot>();
+      const program = Effect.gen(function* () {
+        const manager = yield* ProviderAuthSessionManager.make();
+        const session = yield* manager.start({ instanceId: INSTANCE_ID, action: "signIn" });
+        yield* manager.attachStream({ sessionId: session.sessionId }, (event) =>
+          event.type === "settled" ? Deferred.succeed(settled, event.snapshot) : Effect.void,
+        );
+        harness.emitExit(0);
+        expect(yield* Deferred.await(settled)).toMatchObject({
+          status: "failed",
+          message: "Authentication command completed, but T3 Code could not verify the new state.",
+        });
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      yield* program;
+    }),
+  );
+
   it.effect("rejects the opposite action while a session is active and cancels explicitly", () =>
     Effect.gen(function* () {
       const harness = testHarness();
       const program = Effect.gen(function* () {
-        const manager = yield* make();
+        const manager = yield* ProviderAuthSessionManager.make();
         const session = yield* manager.start({ instanceId: INSTANCE_ID, action: "signIn" });
         const conflict = yield* Effect.flip(
           manager.start({ instanceId: INSTANCE_ID, action: "signOut" }),
